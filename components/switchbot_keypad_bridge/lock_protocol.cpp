@@ -16,6 +16,8 @@ constexpr uint8_t FRAME_STATE_POLL_PREFIX[3] = {0x0F, 0x4F, 0x81};
 // Doorbell press (Keypad Vision). A short, distinct 2-byte opcode the keypad
 // sends on the shared slot when its doorbell button is pressed.
 constexpr uint8_t FRAME_DOORBELL[2]          = {0x01, 0x03};
+// Vision Pro Lock button: captured three times as the same plaintext.
+constexpr uint8_t FRAME_VISION_PRO_LOCK[7]   = {0x0F, 0x4E, 0x04, 0x05, 0x00, 0x80, 0x0A};
 
 // Unlock frame layout: [hdr(4) | method | marker(0x80) | index | ...]
 constexpr size_t  UNLOCK_METHOD_OFFSET = 4;
@@ -58,6 +60,11 @@ DecodedCommand decode_lock_command(const uint8_t *plaintext, size_t length) {
   DecodedCommand out;
 
   if (length == sizeof(FRAME_LOCK) && std::memcmp(plaintext, FRAME_LOCK, sizeof(FRAME_LOCK)) == 0) {
+    out.type = CommandType::LOCK;
+    return out;
+  }
+  if (length == sizeof(FRAME_VISION_PRO_LOCK) &&
+      std::memcmp(plaintext, FRAME_VISION_PRO_LOCK, sizeof(FRAME_VISION_PRO_LOCK)) == 0) {
     out.type = CommandType::LOCK;
     return out;
   }

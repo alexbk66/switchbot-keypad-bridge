@@ -158,9 +158,12 @@ LockSession::Action LockSession::process_frame(const std::string &frame) {
   const bool uses_predecessor =
       uses_retired || (uses_active && this->pending_.valid);
   const bool has_known_unlock_method = unlock_method_index(this->command_.method) >= 0;
+  // One late doorbell is safe to chime; it consumes the same single-use
+  // predecessor allowance so late unlock/lock actions cannot follow it.
   const bool is_late_action =
       (this->command_.type == CommandType::UNLOCK && has_known_unlock_method) ||
-      this->command_.type == CommandType::LOCK;
+      this->command_.type == CommandType::LOCK ||
+      this->command_.type == CommandType::DOORBELL;
 
   // While pending_ is uncommitted, tolerate one already-in-flight poll under
   // active_. A second such poll proves the overlap has advanced without an

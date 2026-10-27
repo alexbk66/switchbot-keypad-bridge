@@ -21,6 +21,8 @@ constexpr uint8_t SLOT_TOUCH = 0x88;
 constexpr std::array<uint8_t, 4> STATE_POLL = {0x0F, 0x4F, 0x81, 0x00};
 constexpr std::array<uint8_t, 8> LOCK = {0x0F, 0x4E, 0x01, 0x03,
                                          0x00, 0x00, 0x00, 0x00};
+constexpr std::array<uint8_t, 7> VISION_PRO_LOCK = {
+    0x0F, 0x4E, 0x04, 0x05, 0x00, 0x80, 0x0A};
 constexpr std::array<uint8_t, 8> UNLOCK = {0x0F, 0x4E, 0x01, 0x03,
                                            0x04, 0x80, 0x00, 0x00};
 constexpr std::array<uint8_t, 8> FINGERPRINT_UNLOCK = {
@@ -330,7 +332,6 @@ void test_rejected_predecessor_attempts_close_handoff() {
   // The first predecessor non-poll frame consumes the one-shot regardless of
   // whether it is admissible. This prevents unlimited probing without time.
   assert_rejected_retired_attempt_closes_handoff(UNKNOWN, 0x27);
-  assert_rejected_retired_attempt_closes_handoff(DOORBELL, 0x28);
   assert_rejected_retired_attempt_closes_handoff(UNKNOWN_METHOD_UNLOCK, 0x29);
 }
 
@@ -348,12 +349,61 @@ void test_rejected_active_predecessor_attempt_closes_handoff() {
   queue_iv(current_iv);
   assert(session.process_frame(iv_request()) == LockSession::Action::SEND_IV);
   assert(session.process_frame(encrypted_frame(predecessor_iv, DOORBELL)) ==
+         LockSession::Action::COMMAND);
+  assert(session.command().type == CommandType::DOORBELL);
+  // The one-shot predecessor allowance is consumed by the ring.
+  assert(session.process_frame(encrypted_frame(predecessor_iv, DOORBELL)) ==
          LockSession::Action::NONE);
   assert(session.process_frame(
              encrypted_frame(predecessor_iv, FINGERPRINT_UNLOCK)) ==
          LockSession::Action::NONE);
   assert(session.process_frame(encrypted_frame(current_iv, STATE_POLL)) ==
          LockSession::Action::COMMAND);
+}
+
+void test_late_doorbell_after_pending_promotion() {
+  LockSession session;
+  session.set_aes_key(TEST_KEY);
+
+  const auto predecessor_iv = make_iv(0x71);
+  const auto current_iv = make_iv(0x72);
+  queue_iv(predecessor_iv);
+  assert(session.process_frame(iv_request()) == LockSession::Action::SEND_IV);
+  assert(session.process_frame(encrypted_frame(predecessor_iv, STATE_POLL)) ==
+         LockSession::Action::COMMAND);
+
+  queue_iv(current_iv);
+  assert(session.process_frame(iv_request()) == LockSession::Action::SEND_IV);
+  assert(session.process_frame(encrypted_frame(current_iv, STATE_POLL)) ==
+         LockSession::Action::COMMAND);
+  assert(session.process_frame(encrypted_frame(predecessor_iv, DOORBELL)) ==
+         LockSession::Action::COMMAND);
+  assert(session.command().type == CommandType::DOORBELL);
+  assert_response_uses_iv(session, predecessor_iv);
+  assert(session.process_frame(encrypted_frame(predecessor_iv, FINGERPRINT_UNLOCK)) ==
+         LockSession::Action::NONE);
+  assert(session.process_frame(encrypted_frame(current_iv, STATE_POLL)) ==
+         LockSession::Action::COMMAND);
+}
+
+void test_vision_pro_lock_button() {
+  LockSession session;
+  session.set_aes_key(TEST_KEY);
+
+  const auto iv = make_iv(0x73);
+  queue_iv(iv);
+  assert(session.process_frame(iv_request()) == LockSession::Action::SEND_IV);
+  const std::string lock = encrypted_frame(iv, VISION_PRO_LOCK);
+  assert(session.process_frame(lock) == LockSession::Action::COMMAND);
+  assert(session.command().type == CommandType::LOCK);
+  assert_response_uses_iv(session, iv);
+  // An identical lock command under the same IV must not execute twice.
+  assert(session.process_frame(lock) == LockSession::Action::NONE);
+
+  auto malformed = VISION_PRO_LOCK;
+  malformed[3] ^= 0x01;
+  assert(session.process_frame(encrypted_frame(iv, malformed)) ==
+         LockSession::Action::NONE);
 }
 
 void test_late_lock_is_admitted_once() {
@@ -1025,6 +1075,8 @@ bool aes_ctr_xcrypt(psa_key_id_t key, const uint8_t iv[16],
 
 int main() {
   test_iv_handoff_and_replay();
+  test_late_doorbell_after_pending_promotion();
+  test_vision_pro_lock_button();
   test_fast_unlock_before_pending_promotion();
   test_fast_unlock_after_pending_promotion();
   test_predecessor_replay_consumes_handoff();
