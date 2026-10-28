@@ -59,6 +59,7 @@ CONF_RESET_BUTTON = "reset_button"
 CONF_ON_LOCK = "on_lock"
 CONF_ON_UNLOCK = "on_unlock"
 CONF_ON_DOORBELL = "on_doorbell"
+CONF_ON_STATUS_POLL = "on_status_poll"
 CONF_PAIRING_UI = "pairing_ui"
 
 # Auto-generated id for the progmem array that carries the embedded UI.
@@ -83,6 +84,9 @@ UnlockTrigger = switchbot_keypad_bridge_ns.class_(
 )
 DoorbellTrigger = switchbot_keypad_bridge_ns.class_(
     "DoorbellTrigger", automation.Trigger.template()
+)
+StatusPollTrigger = switchbot_keypad_bridge_ns.class_(
+    "StatusPollTrigger", automation.Trigger.template()
 )
 
 
@@ -155,6 +159,9 @@ CONFIG_SCHEMA = cv.Schema(
         ),
         cv.Optional(CONF_ON_DOORBELL): automation.validate_automation(
             {cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(DoorbellTrigger)}
+        ),
+        cv.Optional(CONF_ON_STATUS_POLL): automation.validate_automation(
+            {cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(StatusPollTrigger)}
         ),
     }
 ).extend(cv.COMPONENT_SCHEMA)
@@ -286,6 +293,10 @@ async def to_code(config):
         )
 
     for trig_conf in config.get(CONF_ON_DOORBELL, []):
+        trig = cg.new_Pvariable(trig_conf[CONF_TRIGGER_ID], var)
+        await automation.build_automation(trig, [], trig_conf)
+
+    for trig_conf in config.get(CONF_ON_STATUS_POLL, []):
         trig = cg.new_Pvariable(trig_conf[CONF_TRIGGER_ID], var)
         await automation.build_automation(trig, [], trig_conf)
 

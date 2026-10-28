@@ -1,5 +1,6 @@
 esphome:
   name: switchbot-keypad-bridge
+  build_path: C:/My/Temp/HS_Build/ESPHome/SwitchBotKeypadBridgeGit
 
 substitutions:
   shelly_ip: "192.168.68.118"
@@ -50,6 +51,36 @@ ota:
 time:
   - platform: sntp
 
+# Programmable RGB LED on this ESP32-S3-N16R8 board: WS2812, GPIO48.
+# The three small PWR/TX/RX LEDs are hardware indicators, not spare GPIOs.
+light:
+  - platform: esp32_rmt_led_strip
+    id: activity_led
+    pin: GPIO48
+    num_leds: 1
+    chipset: ws2812
+    rgb_order: GRB
+    internal: true
+    restore_mode: ALWAYS_OFF
+    default_transition_length: 0s
+
+script:
+  - id: flash_activity
+    mode: restart
+    parameters:
+      red: float
+      green: float
+      blue: float
+    then:
+      - light.turn_on:
+          id: activity_led
+          red: !lambda 'return red;'
+          green: !lambda 'return green;'
+          blue: !lambda 'return blue;'
+          brightness: 75%
+      - delay: 1s
+      - light.turn_off: activity_led
+
 switchbot_keypad_bridge:
   id: keypad_bridge
   # Rearm Keypad Vision's passive face/palm unlock after each unlock.
@@ -86,15 +117,28 @@ switchbot_keypad_bridge:
 
   lock_battery_level:
     name: "Lock battery"
-  # battery_scan_interval: 15min
+  battery_scan_interval: 1min
 
   reset_button:
     name: "Reset"
 
   # Each action increments a counter so repeated presses update the display.
   # These requests only update virtual components; they do not control a lock.
+  # Light blue briefly when Shelly requests /api/status.
+  on_status_poll:
+    - script.execute:
+        id: flash_activity
+        red: 0.0
+        green: 0.0
+        blue: 1.0
+
   on_unlock:
     # method: pin | fingerprint | nfc | face | palm; index: credential slot
+    - script.execute:
+        id: flash_activity
+        red: 0.0
+        green: 1.0
+        blue: 0.0
     - http_request.get:
         url: !lambda |-
           return str_sprintf(
@@ -106,6 +150,11 @@ switchbot_keypad_bridge:
             - logger.log: "Shelly keypad unlock event update failed"
 
   on_lock:
+    - script.execute:
+        id: flash_activity
+        red: 1.0
+        green: 0.0
+        blue: 0.0
     - http_request.get:
         url: !lambda |-
           return str_sprintf(
@@ -117,6 +166,11 @@ switchbot_keypad_bridge:
             - logger.log: "Shelly keypad lock event update failed"
 
   on_doorbell:
+    - script.execute:
+        id: flash_activity
+        red: 1.0
+        green: 0.0
+        blue: 1.0
     - http_request.get:
         url: !lambda |-
           return str_sprintf(

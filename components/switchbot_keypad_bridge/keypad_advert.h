@@ -55,5 +55,18 @@ int parse_keypad_battery(KeypadFamily family,
                          const uint8_t *svc_data, size_t svc_len,
                          const uint8_t *mfr_data, size_t mfr_len);
 
+// Decoded Keypad Vision / Vision Pro manufacturer advertisement.
+// -1 denotes a field not available in this advertisement.
+struct KeypadVisionAdvertStatus {
+  int battery{-1};
+  int8_t charging{-1};
+  int8_t tamper_alarm{-1};
+  int8_t lockout_alarm{-1};
+  int8_t duress_alarm{-1};
+};
+
+// mfr_data includes the two-byte manufacturer ID (0x69, 0x09).
+KeypadVisionAdvertStatus parse_keypad_vision_status(const uint8_t *mfr_data, size_t len);
+
 }  // namespace switchbot_keypad_bridge
 }  // namespace esphome

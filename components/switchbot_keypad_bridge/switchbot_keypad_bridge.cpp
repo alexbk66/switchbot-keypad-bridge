@@ -152,6 +152,7 @@ void SwitchbotKeypadBridge::setup() {
     }
   }
   this->keypad_paired_ = have_keypad;
+  this->status_keypad_paired_.store(have_keypad);
   this->pairing_ui_.set_keypad_paired(have_keypad);
 
   // Restore the keypad MAC + family used by the battery advert scan. Missing
@@ -199,6 +200,8 @@ void SwitchbotKeypadBridge::setup() {
   }
   ESP_LOGI(TAG, "Ready. Advertising on %s",
            NimBLEDevice::getAddress().toString().c_str());
+  // Failure is logged but must never interrupt the BLE lock bridge.
+  this->start_status_http_();
 
   this->pairing_ui_.set_shared_key(this->shared_key_);
   this->pairing_ui_.set_on_paired_callback(
@@ -262,14 +265,22 @@ void SwitchbotKeypadBridge::loop() {
   for (const auto &ev : pending) {
     if (ev.type == QueuedEvent::CONNECT) {
       ESP_LOGI(TAG, "Keypad connected");
+      this->status_keypad_connected_.store(true);
+      this->status_last_seen_ms_.store(millis());
       this->session_.reset_transport();
     } else if (ev.type == QueuedEvent::DISCONNECT) {
       ESP_LOGI(TAG, "Keypad disconnected, restarting advertising");
+      this->status_keypad_connected_.store(false);
       this->session_.reset_transport();
       NimBLEDevice::startAdvertising();
     } else if (ev.type == QueuedEvent::RX) {
+      this->status_last_seen_ms_.store(millis());
       this->on_rx_frame_(ev.frame);
     }
+  }
+
+  if (this->status_poll_pending_.exchange(false, std::memory_order_acq_rel)) {
+    this->on_status_poll_callbacks_.call();
   }
 
   if (this->keypad_battery_level_sensor_ != nullptr ||
@@ -301,6 +312,14 @@ void SwitchbotKeypadBridge::apply_pending_pairing_() {
     this->save_and_sync_(this->keypad_info_pref_, &this->keypad_info_);
 
     this->keypad_paired_ = true;
+    this->status_keypad_paired_.store(true);
+    this->status_last_seen_ms_.store(0);
+    this->status_battery_at_ms_.store(0);
+    this->status_battery_.store(-1);
+    this->status_charging_.store(-1);
+    this->status_tamper_.store(-1);
+    this->status_lockout_.store(-1);
+    this->status_duress_.store(-1);
     this->pairing_ui_.set_keypad_paired(true);
     this->pairing_ui_.set_keypad_family(this->pending_keypad_family_);
     this->last_keypad_battery_ = -1;
@@ -393,6 +412,19 @@ void SwitchbotKeypadBridge::reset_pairing() {
   this->publish_linked_lock_();
   this->clear_lock_battery_();
   this->keypad_paired_ = false;
+  this->status_keypad_paired_.store(false);
+  this->status_keypad_connected_.store(false);
+  this->status_last_seen_ms_.store(0);
+  this->status_battery_at_ms_.store(0);
+  this->status_battery_.store(-1);
+  this->status_charging_.store(-1);
+  this->status_tamper_.store(-1);
+  this->status_lockout_.store(-1);
+  this->status_duress_.store(-1);
+  {
+    std::lock_guard<std::mutex> lk(this->rx_mutex_);
+    this->keypad_battery_advert_pending_ = false;
+  }
   this->pairing_ui_.set_keypad_paired(false);
   this->pairing_ui_.set_keypad_family(KeypadFamily::ORIGINAL);
   this->reset_battery_sensor_(this->keypad_battery_level_sensor_,
@@ -426,6 +458,78 @@ void SwitchbotKeypadBridge::rearm() {
   ESP_LOGI(TAG, "Reporting locked state on the next keypad poll (rearm)");
 }
 
+// Read-only status server is independent from the short-lived pairing UI.
+// Use a different control port: ESP-IDF HTTP servers cannot share one.
+bool SwitchbotKeypadBridge::start_status_http_() {
+  httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+  cfg.server_port = 8080;
+  cfg.ctrl_port = 32769;
+  cfg.max_open_sockets = 3;
+  cfg.lru_purge_enable = true;
+  if (httpd_start(&this->status_http_server_, &cfg) != ESP_OK) {
+    ESP_LOGE(TAG, "Unable to start status HTTP server on port 8080");
+    return false;
+  }
+  httpd_uri_t uri{};
+  uri.uri = "/api/status";
+  uri.method = HTTP_GET;
+  uri.handler = &SwitchbotKeypadBridge::status_http_handler_;
+  uri.user_ctx = this;
+  if (httpd_register_uri_handler(this->status_http_server_, &uri) != ESP_OK) {
+    ESP_LOGE(TAG, "Unable to register /api/status");
+    httpd_stop(this->status_http_server_);
+    this->status_http_server_ = nullptr;
+    return false;
+  }
+  ESP_LOGI(TAG, "Status API listening on port 8080");
+  return true;
+}
+
+esp_err_t SwitchbotKeypadBridge::status_http_handler_(httpd_req_t *req) {
+  auto *self = static_cast<SwitchbotKeypadBridge *>(req->user_ctx);
+  const uint32_t now = millis();
+  const uint32_t seen_at = self->status_last_seen_ms_.load();
+  const uint32_t battery_at = self->status_battery_at_ms_.load();
+  const int battery = self->status_battery_.load();
+  const bool connected = self->status_keypad_connected_.load();
+  const bool paired = self->status_keypad_paired_.load();
+  const bool online = paired && (connected || (seen_at != 0 && (now - seen_at) < 300000u));
+
+  char last_seen_age[16], battery_age[16], battery_json[12];
+  if (seen_at) std::snprintf(last_seen_age, sizeof(last_seen_age), "%lu",
+                              static_cast<unsigned long>((now - seen_at) / 1000u));
+  else std::strcpy(last_seen_age, "null");
+  if (battery_at && battery >= 0) {
+    std::snprintf(battery_age, sizeof(battery_age), "%lu",
+                  static_cast<unsigned long>((now - battery_at) / 1000u));
+    std::snprintf(battery_json, sizeof(battery_json), "%d", battery);
+  } else {
+    std::strcpy(battery_age, "null");
+    std::strcpy(battery_json, "null");
+  }
+  auto tri = [](int8_t v) -> const char * {
+    return v < 0 ? "null" : (v ? "true" : "false");
+  };
+  const char *available = !paired || (seen_at == 0 && !connected) ? "null" :
+                          (online ? "true" : "false");
+  char json[512];
+  std::snprintf(json, sizeof(json),
+      "{\"uptime_s\":%lu,\"keypad\":{\"paired\":%s,\"ble_connected\":%s,"
+      "\"online\":%s,\"last_seen_age_s\":%s,\"battery\":%s,"
+      "\"battery_age_s\":%s,\"battery_charging\":%s,\"tamper_alarm\":%s,"
+      "\"lockout_alarm\":%s,\"duress_alarm\":%s}}",
+      static_cast<unsigned long>(now / 1000u), paired ? "true" : "false",
+      connected ? "true" : "false", available, last_seen_age, battery_json,
+      battery_age, tri(self->status_charging_.load()),
+      tri(self->status_tamper_.load()), tri(self->status_lockout_.load()),
+      tri(self->status_duress_.load()));
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  // An atomic handoff ensures the RMT LED automation runs on the ESPHome task.
+  self->status_poll_pending_.store(true, std::memory_order_release);
+  return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+}
+
 void SwitchbotKeypadBridge::update_rearm_timer_() {
   if (this->keypad_state_.update(millis())) {
     ESP_LOGI(TAG, "Face/palm rearm timer expired; reporting locked state on the next keypad poll");
@@ -436,6 +540,8 @@ void SwitchbotKeypadBridge::dump_config() {
   ESP_LOGCONFIG(TAG, "SwitchBot Keypad Bridge:");
   ESP_LOGCONFIG(TAG, "  BLE address: %s", NimBLEDevice::getAddress().toString().c_str());
   ESP_LOGCONFIG(TAG, "  Setup UI: port 80");
+  ESP_LOGCONFIG(TAG, "  Read-only status API: port 8080 (%s)",
+                this->status_http_server_ != nullptr ? "ready" : "unavailable");
   ESP_LOGCONFIG(TAG, "  Face/palm rearm after: %ums (0 = disabled)",
                 static_cast<unsigned>(this->keypad_state_.rearm_after()));
   ESP_LOGCONFIG(TAG, "  Physical lock relay: %s",
@@ -938,12 +1044,18 @@ void SwitchbotKeypadBridge::handle_battery_advert_(const NimBLEAdvertisedDevice 
     }
 
     if (keypad_match) {
-      const int battery = parse_keypad_battery(
-          family, sd.data(), sd.size(),
-          reinterpret_cast<const uint8_t *>(mfr.data()), mfr.size());
+      // Even an advertisement without battery data proves the keypad was seen.
+      this->status_last_seen_ms_.store(millis());
+      const auto vision = family == KeypadFamily::VISION
+          ? parse_keypad_vision_status(reinterpret_cast<const uint8_t *>(mfr.data()), mfr.size())
+          : KeypadVisionAdvertStatus{};
+      const int battery = family == KeypadFamily::VISION ? vision.battery :
+          parse_keypad_battery(family, sd.data(), sd.size(),
+                               reinterpret_cast<const uint8_t *>(mfr.data()), mfr.size());
       if (battery >= 0) {
         std::lock_guard<std::mutex> lk(this->rx_mutex_);
         this->keypad_battery_advert_value_ = battery;
+        this->keypad_advert_status_ = vision;
         std::memcpy(this->keypad_battery_advert_mac_, mac.data(), mac.size());
         this->keypad_battery_advert_family_ = static_cast<uint8_t>(family);
         this->keypad_battery_advert_pending_ = true;
@@ -973,14 +1085,22 @@ void SwitchbotKeypadBridge::apply_pending_keypad_battery_() {
   int value;
   uint8_t mac[6];
   uint8_t family;
+  KeypadVisionAdvertStatus vision;
   {
     std::lock_guard<std::mutex> lk(this->rx_mutex_);
     if (!this->keypad_battery_advert_pending_) return;
     this->keypad_battery_advert_pending_ = false;
     value = this->keypad_battery_advert_value_;
+    vision = this->keypad_advert_status_;
     std::memcpy(mac, this->keypad_battery_advert_mac_, sizeof(mac));
     family = this->keypad_battery_advert_family_;
   }
+  this->status_battery_.store(value);
+  this->status_battery_at_ms_.store(millis());
+  if (vision.charging >= 0) this->status_charging_.store(vision.charging);
+  if (vision.tamper_alarm >= 0) this->status_tamper_.store(vision.tamper_alarm);
+  if (vision.lockout_alarm >= 0) this->status_lockout_.store(vision.lockout_alarm);
+  if (vision.duress_alarm >= 0) this->status_duress_.store(vision.duress_alarm);
 
   if (this->keypad_info_.valid == 0) {
     std::memcpy(this->keypad_info_.mac, mac, sizeof(this->keypad_info_.mac));
@@ -1043,9 +1163,11 @@ void SwitchbotKeypadBridge::stop_battery_scan_() {
 }
 
 bool SwitchbotKeypadBridge::background_ble_busy_() const {
+  // The Vision Pro keeps advertising while connected. Allow the short battery
+  // scan to run concurrently with its BLE connection; pairing and physical
+  // lock relay operations still take precedence over the shared scanner.
   return this->pairing_ui_.is_running() ||
-         this->lock_relay_busy_.load(std::memory_order_relaxed) ||
-         (this->server_ != nullptr && this->server_->getConnectedCount() > 0);
+         this->lock_relay_busy_.load(std::memory_order_relaxed);
 }
 
 void SwitchbotKeypadBridge::clear_lock_battery_() {

@@ -10,6 +10,8 @@
 #include <mutex>
 #include <vector>
 
+#include <esp_http_server.h>
+
 #include "esphome/components/button/button.h"
 #include "esphome/components/event/event.h"
 #include "esphome/components/sensor/sensor.h"
@@ -97,6 +99,9 @@ class SwitchbotKeypadBridge : public Component {
   void add_on_doorbell_callback(std::function<void()> &&callback) {
     this->on_doorbell_callbacks_.add(std::move(callback));
   }
+  void add_on_status_poll_callback(std::function<void()> &&callback) {
+    this->on_status_poll_callbacks_.add(std::move(callback));
+  }
 
  protected:
   class ServerCallbacks;
@@ -140,6 +145,10 @@ class SwitchbotKeypadBridge : public Component {
 
   bool prepare_keys_();
   bool prepare_ble_();
+
+  // Always-on, read-only LAN status endpoint (the pairing wizard is transient).
+  bool start_status_http_();
+  static esp_err_t status_http_handler_(httpd_req_t *req);
 
   // ----- BLE write handling --------------------------------------------------
 
@@ -199,6 +208,21 @@ class SwitchbotKeypadBridge : public Component {
 
   NimBLEServer *server_{nullptr};
   NimBLECharacteristic *tx_characteristic_{nullptr};
+  httpd_handle_t status_http_server_{nullptr};
+  // The HTTP task must not invoke ESPHome automations; loop() drains this flag.
+  std::atomic<bool> status_poll_pending_{false};
+
+  // Status fields read by the ESP-IDF HTTP server task, updated on the main
+  // ESPHome task (except last_seen which is also written by NimBLE callback).
+  std::atomic<bool> status_keypad_paired_{false};
+  std::atomic<bool> status_keypad_connected_{false};
+  std::atomic<uint32_t> status_last_seen_ms_{0};  // 0 = never seen since boot
+  std::atomic<uint32_t> status_battery_at_ms_{0};
+  std::atomic<int> status_battery_{-1};
+  std::atomic<int8_t> status_charging_{-1};
+  std::atomic<int8_t> status_tamper_{-1};
+  std::atomic<int8_t> status_lockout_{-1};
+  std::atomic<int8_t> status_duress_{-1};
 
   // ----- Thread-safe event queueing from NimBLE callbacks --------------------
 
@@ -242,6 +266,7 @@ class SwitchbotKeypadBridge : public Component {
   CallbackManager<void()> on_lock_callbacks_{};
   CallbackManager<void(std::string, int)> on_unlock_callbacks_{};
   CallbackManager<void()> on_doorbell_callbacks_{};
+  CallbackManager<void()> on_status_poll_callbacks_{};
 
   // ----- User configuration --------------------------------------------------
 
@@ -305,6 +330,7 @@ class SwitchbotKeypadBridge : public Component {
   // under rx_mutex_ (same pattern as the RX queue).
   bool keypad_battery_advert_pending_{false};
   int keypad_battery_advert_value_{-1};
+  KeypadVisionAdvertStatus keypad_advert_status_{};
   uint8_t keypad_battery_advert_mac_[6]{};
   uint8_t keypad_battery_advert_family_{0};
   bool lock_battery_advert_pending_{false};

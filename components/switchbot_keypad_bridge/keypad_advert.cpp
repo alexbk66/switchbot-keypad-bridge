@@ -83,5 +83,22 @@ int parse_keypad_battery(KeypadFamily family,
   return mfr_data[9] & 0x7F;
 }
 
+KeypadVisionAdvertStatus parse_keypad_vision_status(const uint8_t *mfr_data, size_t len) {
+  KeypadVisionAdvertStatus out;
+  if (mfr_data == nullptr || len < 11 || mfr_data[0] != 0x69 || mfr_data[1] != 0x09)
+    return out;
+
+  // pySwitchbot's mfr_data excludes the 2-byte company ID.
+  // Battery/charging: byte 7. Alarm flags: byte 8.
+  out.battery = mfr_data[9] & 0x7F;
+  out.charging = (mfr_data[9] & 0x80) != 0;
+  if (len >= 15) {  // Require complete Vision manufacturer payload.
+    out.lockout_alarm = (mfr_data[10] & 0x01) != 0;
+    out.tamper_alarm = (mfr_data[10] & 0x02) != 0;
+    out.duress_alarm = (mfr_data[10] & 0x04) != 0;
+  }
+  return out;
+}
+
 }  // namespace switchbot_keypad_bridge
 }  // namespace esphome

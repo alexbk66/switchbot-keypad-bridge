@@ -37,5 +37,12 @@ class DoorbellTrigger : public Trigger<> {
   }
 };
 
+class StatusPollTrigger : public Trigger<> {
+ public:
+  explicit StatusPollTrigger(SwitchbotKeypadBridge *parent) {
+    parent->add_on_status_poll_callback([this]() { this->trigger(); });
+  }
+};
+
 }  // namespace switchbot_keypad_bridge
 }  // namespace esphome
