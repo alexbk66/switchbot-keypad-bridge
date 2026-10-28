@@ -1,6 +1,17 @@
 esphome:
   name: switchbot-keypad-bridge
 
+substitutions:
+  shelly_ip: "192.168.68.118"
+
+http_request:
+  timeout: 3s
+
+globals:
+  - id: keypad_action_seq
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -58,6 +69,21 @@ switchbot_keypad_bridge:
   # shared background scan below.
   keypad_battery_level:
     name: "Keypad battery"
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return !std::isnan(x);'
+            then:
+              - http_request.get:
+                  url: !lambda |-
+                    return str_sprintf(
+                      "http://${shelly_ip}/rpc/Number.Set?id=200&value=%.0f", x
+                    );
+                  on_error:
+                    then:
+                      - logger.log: "Shelly keypad battery update failed"
+
   lock_battery_level:
     name: "Lock battery"
   # battery_scan_interval: 15min
@@ -65,19 +91,41 @@ switchbot_keypad_bridge:
   reset_button:
     name: "Reset"
 
+  # Each action increments a counter so repeated presses update the display.
+  # These requests only update virtual components; they do not control a lock.
   on_unlock:
-    # method: "pin" | "fingerprint" | "nfc" | "face" | "palm" | "unknown"   index: credential slot
-    - homeassistant.event:
-        event: esphome.switchbot_keypad_unlock
-        data:
-          method: !lambda 'return method;'
-          index: !lambda 'return to_string(index);'
-  
-  # on_lock:
-  #   - logger.log: "Locked"
+    # method: pin | fingerprint | nfc | face | palm; index: credential slot
+    - http_request.get:
+        url: !lambda |-
+          return str_sprintf(
+            "http://${shelly_ip}/rpc/Text.Set?id=200&value=%%22%s%%20%%23%d%%20(%lu)%%22",
+            method.c_str(), index, (unsigned long) ++id(keypad_action_seq)
+          );
+        on_error:
+          then:
+            - logger.log: "Shelly keypad unlock event update failed"
 
-  # on_doorbell:
-  #   - logger.log: "Doorbell pressed"
+  on_lock:
+    - http_request.get:
+        url: !lambda |-
+          return str_sprintf(
+            "http://${shelly_ip}/rpc/Text.Set?id=200&value=%%22Lock%%20(%lu)%%22",
+            (unsigned long) ++id(keypad_action_seq)
+          );
+        on_error:
+          then:
+            - logger.log: "Shelly keypad lock event update failed"
+
+  on_doorbell:
+    - http_request.get:
+        url: !lambda |-
+          return str_sprintf(
+            "http://${shelly_ip}/rpc/Text.Set?id=200&value=%%22Doorbell%%20(%lu)%%22",
+            (unsigned long) ++id(keypad_action_seq)
+          );
+        on_error:
+          then:
+            - logger.log: "Shelly keypad doorbell update failed"
 
 # Optional button to manually rearm face/palm unlock using the same action.
 # button:
