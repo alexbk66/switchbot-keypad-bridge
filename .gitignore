@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 venv
 switchbot-keypad-bridge~.yaml
+Shelly/OLD/

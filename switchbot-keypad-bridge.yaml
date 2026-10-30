@@ -1,9 +1,15 @@
 esphome:
   name: switchbot-keypad-bridge
-  build_path: C:/My/Temp/HS_Build/ESPHome/SwitchBotKeypadBridgeGit
+  build_path: !secret esphome_build_path
 
 substitutions:
-  shelly_ip: "192.168.68.118"
+  # Complete Shelly RPC URL prefixes, including component IDs.
+  # The event value is appended at runtime.
+  shelly_panel1_action_url: !secret shelly_panel1_action_url
+  shelly_panel2_action_url: !secret shelly_panel2_action_url
+  shelly_panel1_battery_url: !secret shelly_panel1_battery_url
+  loqed_garage_night_lock_url: !secret loqed_garage_night_lock_url
+  loqed_garage_latch_url: !secret loqed_garage_latch_url
 
 http_request:
   timeout: 3s
@@ -65,6 +71,76 @@ light:
     default_transition_length: 0s
 
 script:
+  # Sequentially send HTTP requests to the destinations in an array.
+  # Keep LOQED first so panel timeouts cannot delay the lock command.
+  - id: send_urls
+    mode: queued
+    max_runs: 10
+    parameters:
+      urls: string[]
+    then:
+      - repeat:
+          count: !lambda 'return static_cast<int>(urls.size());'
+          then:
+            - http_request.get:
+                url: !lambda 'return urls[iteration];'
+                on_response:
+                  then:
+                    - logger.log:
+                        format: "Keypad dispatch HTTP %d"
+                        args: [response->status_code]
+                on_error:
+                  then:
+                    - logger.log: "Keypad dispatch HTTP request failed"
+
+  # One actual lock destination: Garage LOQED Pure.
+  # Two display destinations: the Shelly panels' Text virtual components.
+  # This does NOT invoke either panel's Boolean lock toggle.
+  - id: lock_all
+    then:
+      - lambda: |-
+          const unsigned long seq = (unsigned long) ++id(keypad_action_seq);
+          const std::string value = str_sprintf("L%lu", seq);
+          id(send_urls)->execute(std::vector<std::string>{
+            "${loqed_garage_night_lock_url}",
+            std::string("${shelly_panel1_action_url}") + value,
+            std::string("${shelly_panel2_action_url}") + value
+          });
+
+  - id: unlock_all
+    parameters:
+      method: string
+      index: int
+    then:
+      - lambda: |-
+          const char *m =
+            method == "face" ? "F" :
+            method == "fingerprint" ? "FP" :
+            method == "pin" ? "P" :
+            method == "palm" ? "PA" :
+            method == "nfc" ? "N" : "U";
+          const unsigned long seq = (unsigned long) ++id(keypad_action_seq);
+          const std::string value = str_sprintf("%s%d-%lu", m, index, seq);
+          std::vector<std::string> urls;
+          // Only recognized credential types may operate the physical lock.
+          if (method == "face" || method == "fingerprint" || method == "pin" ||
+              method == "palm" || method == "nfc") {
+            urls.push_back("${loqed_garage_latch_url}");
+          }
+          urls.push_back(std::string("${shelly_panel1_action_url}") + value);
+          urls.push_back(std::string("${shelly_panel2_action_url}") + value);
+          id(send_urls)->execute(urls);
+
+  - id: report_doorbell
+    then:
+      - lambda: |-
+          const unsigned long seq = (unsigned long) ++id(keypad_action_seq);
+          const std::string value = str_sprintf("B%lu", seq);
+          id(send_urls)->execute(std::vector<std::string>{
+            std::string("${shelly_panel1_action_url}") + value,
+            std::string("${shelly_panel2_action_url}") + value
+          });
+
   - id: flash_activity
     mode: restart
     parameters:
@@ -78,8 +154,20 @@ script:
           green: !lambda 'return green;'
           blue: !lambda 'return blue;'
           brightness: 75%
-      - delay: 1s
+      - delay: 2s
       - light.turn_off: activity_led
+
+mdns:
+  disabled: false
+  services:
+    - service: "_sbkeypad"
+      protocol: "_tcp"
+      port: 8080
+      txt:
+        model: "KeypadVisionPro"
+        keypad_mac: "B0E9FEEA3ABC"
+        status_path: "/api/status"
+        bridge: "ESPHome"
 
 switchbot_keypad_bridge:
   id: keypad_bridge
@@ -108,9 +196,8 @@ switchbot_keypad_bridge:
             then:
               - http_request.get:
                   url: !lambda |-
-                    return str_sprintf(
-                      "http://${shelly_ip}/rpc/Number.Set?id=200&value=%.0f", x
-                    );
+                    return std::string("${shelly_panel1_battery_url}") +
+                           str_sprintf("%.0f", x);
                   on_error:
                     then:
                       - logger.log: "Shelly keypad battery update failed"
@@ -122,32 +209,32 @@ switchbot_keypad_bridge:
   reset_button:
     name: "Reset"
 
-  # Each action increments a counter so repeated presses update the display.
-  # These requests only update virtual components; they do not control a lock.
-  # Light blue briefly when Shelly requests /api/status.
+  # Events notify both panels; only recognized keypad lock/unlock events
+  # operate the Garage LOQED Pure directly.
   on_status_poll:
-    - script.execute:
-        id: flash_activity
-        red: 0.0
-        green: 0.0
-        blue: 1.0
+  - if:
+      condition:
+        not:
+          script.is_running: flash_activity
+      then:
+        - script.execute:
+            id: flash_activity
+            red: 0.0
+            green: 0.0
+            blue: 1.0
 
   on_unlock:
-    # method: pin | fingerprint | nfc | face | palm; index: credential slot
     - script.execute:
         id: flash_activity
         red: 0.0
         green: 1.0
         blue: 0.0
-    - http_request.get:
-        url: !lambda |-
-          return str_sprintf(
-            "http://${shelly_ip}/rpc/Text.Set?id=200&value=%%22%s%%20%%23%d%%20(%lu)%%22",
-            method.c_str(), index, (unsigned long) ++id(keypad_action_seq)
-          );
-        on_error:
-          then:
-            - logger.log: "Shelly keypad unlock event update failed"
+    # Yield so the WS2812 update reaches the hardware before blocking HTTP.
+    - delay: 30ms
+    - script.execute:
+        id: unlock_all
+        method: !lambda 'return method;'
+        index: !lambda 'return index;'
 
   on_lock:
     - script.execute:
@@ -155,15 +242,8 @@ switchbot_keypad_bridge:
         red: 1.0
         green: 0.0
         blue: 0.0
-    - http_request.get:
-        url: !lambda |-
-          return str_sprintf(
-            "http://${shelly_ip}/rpc/Text.Set?id=200&value=%%22Lock%%20(%lu)%%22",
-            (unsigned long) ++id(keypad_action_seq)
-          );
-        on_error:
-          then:
-            - logger.log: "Shelly keypad lock event update failed"
+    - delay: 30ms
+    - script.execute: lock_all
 
   on_doorbell:
     - script.execute:
@@ -171,15 +251,8 @@ switchbot_keypad_bridge:
         red: 1.0
         green: 0.0
         blue: 1.0
-    - http_request.get:
-        url: !lambda |-
-          return str_sprintf(
-            "http://${shelly_ip}/rpc/Text.Set?id=200&value=%%22Doorbell%%20(%lu)%%22",
-            (unsigned long) ++id(keypad_action_seq)
-          );
-        on_error:
-          then:
-            - logger.log: "Shelly keypad doorbell update failed"
+    - delay: 30ms
+    - script.execute: report_doorbell
 
 # Optional button to manually rearm face/palm unlock using the same action.
 # button:
