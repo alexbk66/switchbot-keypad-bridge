@@ -1,6 +1,8 @@
 esphome:
   name: switchbot-keypad-bridge
   build_path: !secret esphome_build_path
+  includes:
+    - <esphome/components/switchbot_keypad_bridge/keypad_http_dispatch.h>
 
 substitutions:
   # Complete Shelly RPC URL prefixes, including component IDs.
@@ -11,6 +13,8 @@ substitutions:
   loqed_garage_night_lock_url: !secret loqed_garage_night_lock_url
   loqed_garage_latch_url: !secret loqed_garage_latch_url
 
+# Retain the ESPHome component to bring in ESP-IDF esp_http_client support.
+# Actual HTTP requests are made by keypad_http_dispatch.cpp on a worker task.
 http_request:
   timeout: 3s
 
@@ -71,28 +75,8 @@ light:
     default_transition_length: 0s
 
 script:
-  # Sequentially send HTTP requests to the destinations in an array.
-  # Keep LOQED first so panel timeouts cannot delay the lock command.
-  - id: send_urls
-    mode: queued
-    max_runs: 10
-    parameters:
-      urls: string[]
-    then:
-      - repeat:
-          count: !lambda 'return static_cast<int>(urls.size());'
-          then:
-            - http_request.get:
-                url: !lambda 'return urls[iteration];'
-                on_response:
-                  then:
-                    - logger.log:
-                        format: "Keypad dispatch HTTP %d"
-                        args: [response->status_code]
-                on_error:
-                  then:
-                    - logger.log: "Keypad dispatch HTTP request failed"
-
+  # Queue HTTP work without blocking the ESPHome loop.
+  # The worker sends LOQED first, then both panel notifications.
   # One actual lock destination: Garage LOQED Pure.
   # Two display destinations: the Shelly panels' Text virtual components.
   # This does NOT invoke either panel's Boolean lock toggle.
@@ -101,7 +85,7 @@ script:
       - lambda: |-
           const unsigned long seq = (unsigned long) ++id(keypad_action_seq);
           const std::string value = str_sprintf("L%lu", seq);
-          id(send_urls)->execute(std::vector<std::string>{
+          keypad_http::Dispatcher::instance().enqueue(keypad_http::Kind::LOCK, std::vector<std::string>{
             "${loqed_garage_night_lock_url}",
             std::string("${shelly_panel1_action_url}") + value,
             std::string("${shelly_panel2_action_url}") + value
@@ -129,14 +113,14 @@ script:
           }
           urls.push_back(std::string("${shelly_panel1_action_url}") + value);
           urls.push_back(std::string("${shelly_panel2_action_url}") + value);
-          id(send_urls)->execute(urls);
+          keypad_http::Dispatcher::instance().enqueue(keypad_http::Kind::UNLOCK, urls);
 
   - id: report_doorbell
     then:
       - lambda: |-
           const unsigned long seq = (unsigned long) ++id(keypad_action_seq);
           const std::string value = str_sprintf("B%lu", seq);
-          id(send_urls)->execute(std::vector<std::string>{
+          keypad_http::Dispatcher::instance().enqueue(keypad_http::Kind::DOORBELL, std::vector<std::string>{
             std::string("${shelly_panel1_action_url}") + value,
             std::string("${shelly_panel2_action_url}") + value
           });
@@ -194,13 +178,11 @@ switchbot_keypad_bridge:
             condition:
               lambda: 'return !std::isnan(x);'
             then:
-              - http_request.get:
-                  url: !lambda |-
-                    return std::string("${shelly_panel1_battery_url}") +
-                           str_sprintf("%.0f", x);
-                  on_error:
-                    then:
-                      - logger.log: "Shelly keypad battery update failed"
+              - lambda: |-
+                  const auto url = std::string("${shelly_panel1_battery_url}") +
+                                   str_sprintf("%.0f", x);
+                  keypad_http::Dispatcher::instance().enqueue(
+                      keypad_http::Kind::BATTERY, std::vector<std::string>{url});
 
   lock_battery_level:
     name: "Lock battery"
@@ -229,7 +211,7 @@ switchbot_keypad_bridge:
         red: 0.0
         green: 1.0
         blue: 0.0
-    # Yield so the WS2812 update reaches the hardware before blocking HTTP.
+    # Yield briefly for the WS2812 update; network I/O runs in a separate task.
     - delay: 30ms
     - script.execute:
         id: unlock_all
