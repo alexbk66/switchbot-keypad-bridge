@@ -84,6 +84,10 @@ class SwitchbotKeypadBridge : public Component {
   // or publishing a Lock event. Safe to call from local ESPHome automations.
   void rearm();
 
+  // Thread-safe snapshots also exposed in /api/status.
+  bool ble_connected() const { return this->status_keypad_connected_.load(); }
+  bool ble_advertising() const { return this->status_ble_advertising_.load(); }
+
   bool is_pairing_active() const { return this->pairing_ui_.is_running(); }
 
   // Forgets the linked keypad and lock, rotates the shared key in place and
@@ -145,6 +149,7 @@ class SwitchbotKeypadBridge : public Component {
 
   bool prepare_keys_();
   bool prepare_ble_();
+  void watch_ble_advertising_();
 
   // Always-on, read-only LAN status endpoint (the pairing wizard is transient).
   bool start_status_http_();
@@ -208,6 +213,7 @@ class SwitchbotKeypadBridge : public Component {
 
   NimBLEServer *server_{nullptr};
   NimBLECharacteristic *tx_characteristic_{nullptr};
+  uint32_t next_ble_advertising_check_ms_{0};
   httpd_handle_t status_http_server_{nullptr};
   // The HTTP task must not invoke ESPHome automations; loop() drains this flag.
   std::atomic<bool> status_poll_pending_{false};
@@ -216,6 +222,7 @@ class SwitchbotKeypadBridge : public Component {
   // ESPHome task (except last_seen which is also written by NimBLE callback).
   std::atomic<bool> status_keypad_paired_{false};
   std::atomic<bool> status_keypad_connected_{false};
+  std::atomic<bool> status_ble_advertising_{false};
   std::atomic<uint32_t> status_last_seen_ms_{0};  // 0 = never seen since boot
   std::atomic<uint32_t> status_battery_at_ms_{0};
   std::atomic<int> status_battery_{-1};
@@ -229,13 +236,14 @@ class SwitchbotKeypadBridge : public Component {
   struct QueuedEvent {
     enum Type { CONNECT, DISCONNECT, RX } type;
     std::string frame;
+    int reason{0};  // HCI/NimBLE disconnect reason (DISCONNECT events only)
   };
 
   std::mutex rx_mutex_;
   std::vector<QueuedEvent> rx_queue_;
 
   void push_connect_();
-  void push_disconnect_();
+  void push_disconnect_(int reason);
   void push_rx_(const std::string &frame);
 
   // ----- On-device setup wizard ----------------------------------------------

@@ -48,6 +48,9 @@ constexpr size_t AES_KEY_SIZE = 16;
 constexpr uint32_t BATTERY_SCAN_DURATION_MS = 5000;
 constexpr uint32_t BATTERY_SCAN_RETRY_MS    = 30000;
 
+// Keep the BLE peripheral discoverable if advertising unexpectedly stops.
+constexpr uint32_t BLE_ADVERTISING_WATCHDOG_INTERVAL_MS = 5000;
+
 bool is_shared_slot(uint8_t slot) {
   return slot == SHARED_SLOT_ORIGINAL || slot == SHARED_SLOT_VISION;
 }
@@ -67,7 +70,7 @@ class SwitchbotKeypadBridge::ServerCallbacks : public NimBLEServerCallbacks {
   }
 
   void onDisconnect(NimBLEServer *server, NimBLEConnInfo &info, int reason) override {
-    this->parent_->push_disconnect_();
+    this->parent_->push_disconnect_(reason);
   }
 
  private:
@@ -110,9 +113,9 @@ void SwitchbotKeypadBridge::push_connect_() {
   this->rx_queue_.push_back({QueuedEvent::CONNECT, ""});
 }
 
-void SwitchbotKeypadBridge::push_disconnect_() {
+void SwitchbotKeypadBridge::push_disconnect_(int reason) {
   std::lock_guard<std::mutex> lk(this->rx_mutex_);
-  this->rx_queue_.push_back({QueuedEvent::DISCONNECT, ""});
+  this->rx_queue_.push_back({QueuedEvent::DISCONNECT, "", reason});
 }
 
 void SwitchbotKeypadBridge::push_rx_(const std::string &frame) {
@@ -200,6 +203,8 @@ void SwitchbotKeypadBridge::setup() {
   }
   ESP_LOGI(TAG, "Ready. Advertising on %s",
            NimBLEDevice::getAddress().toString().c_str());
+  this->status_ble_advertising_.store(NimBLEDevice::getAdvertising()->isAdvertising());
+  this->next_ble_advertising_check_ms_ = millis() + BLE_ADVERTISING_WATCHDOG_INTERVAL_MS;
   // Failure is logged but must never interrupt the BLE lock bridge.
   this->start_status_http_();
 
@@ -267,12 +272,21 @@ void SwitchbotKeypadBridge::loop() {
       ESP_LOGI(TAG, "Keypad connected");
       this->status_keypad_connected_.store(true);
       this->status_last_seen_ms_.store(millis());
+      this->status_ble_advertising_.store(NimBLEDevice::getAdvertising()->isAdvertising());
       this->session_.reset_transport();
     } else if (ev.type == QueuedEvent::DISCONNECT) {
-      ESP_LOGI(TAG, "Keypad disconnected, restarting advertising");
+      ESP_LOGI(TAG, "Keypad disconnected (reason=0x%02X)", ev.reason);
       this->status_keypad_connected_.store(false);
       this->session_.reset_transport();
-      NimBLEDevice::startAdvertising();
+      NimBLEAdvertising *advertising = NimBLEDevice::getAdvertising();
+      if (advertising != nullptr && !advertising->isAdvertising()) {
+        if (advertising->start()) {
+          ESP_LOGI(TAG, "BLE advertising restarted after disconnect");
+        } else {
+          ESP_LOGW(TAG, "BLE advertising restart failed; watchdog will retry");
+        }
+      }
+      this->status_ble_advertising_.store(advertising != nullptr && advertising->isAdvertising());
     } else if (ev.type == QueuedEvent::RX) {
       this->status_last_seen_ms_.store(millis());
       this->on_rx_frame_(ev.frame);
@@ -289,6 +303,40 @@ void SwitchbotKeypadBridge::loop() {
     this->apply_pending_lock_battery_();
     this->maybe_finish_battery_scan_();
     this->maybe_start_battery_scan_();
+  }
+  this->watch_ble_advertising_();
+}
+
+void SwitchbotKeypadBridge::watch_ble_advertising_() {
+  const uint32_t now = millis();
+  if (static_cast<int32_t>(now - this->next_ble_advertising_check_ms_) < 0) return;
+  this->next_ble_advertising_check_ms_ = now + BLE_ADVERTISING_WATCHDOG_INTERVAL_MS;
+
+  if (this->server_ == nullptr) return;
+  NimBLEAdvertising *advertising = NimBLEDevice::getAdvertising();
+  if (advertising == nullptr) return;
+
+  const bool active = advertising->isAdvertising();
+  this->status_ble_advertising_.store(active, std::memory_order_relaxed);
+  // A connected keypad does not require advertising for its current session.
+  if (active || this->server_->getConnectedCount() > 0) return;
+
+  // Do not interrupt pairing, a physical-lock relay, or an active BLE scan.
+  if (this->pairing_ui_.is_running() ||
+      this->lock_relay_busy_.load(std::memory_order_relaxed) ||
+      NimBLEDevice::getScan()->isScanning()) return;
+
+  if (!advertising->start()) {
+    ESP_LOGW(TAG, "BLE advertising watchdog: restart failed; retry in %ums",
+             static_cast<unsigned>(BLE_ADVERTISING_WATCHDOG_INTERVAL_MS));
+    return;
+  }
+  const bool recovered = advertising->isAdvertising();
+  this->status_ble_advertising_.store(recovered, std::memory_order_relaxed);
+  if (recovered) {
+    ESP_LOGW(TAG, "BLE advertising watchdog: restarted advertising");
+  } else {
+    ESP_LOGW(TAG, "BLE advertising watchdog: start succeeded but advertising is still inactive");
   }
 }
 
@@ -515,11 +563,13 @@ esp_err_t SwitchbotKeypadBridge::status_http_handler_(httpd_req_t *req) {
   char json[512];
   std::snprintf(json, sizeof(json),
       "{\"uptime_s\":%lu,\"keypad\":{\"paired\":%s,\"ble_connected\":%s,"
-      "\"online\":%s,\"last_seen_age_s\":%s,\"battery\":%s,"
+      "\"ble_advertising\":%s,\"online\":%s,\"last_seen_age_s\":%s,\"battery\":%s,"
       "\"battery_age_s\":%s,\"battery_charging\":%s,\"tamper_alarm\":%s,"
       "\"lockout_alarm\":%s,\"duress_alarm\":%s}}",
       static_cast<unsigned long>(now / 1000u), paired ? "true" : "false",
-      connected ? "true" : "false", available, last_seen_age, battery_json,
+      connected ? "true" : "false",
+      self->status_ble_advertising_.load() ? "true" : "false",
+      available, last_seen_age, battery_json,
       battery_age, tri(self->status_charging_.load()),
       tri(self->status_tamper_.load()), tri(self->status_lockout_.load()),
       tri(self->status_duress_.load()));
