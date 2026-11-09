@@ -1202,7 +1202,9 @@ void SwitchbotKeypadBridge::stop_battery_scan_() {
     if (scan->isScanning()) {
       scan->stop();
     }
-    scan->clearResults();
+    // Do not free scan results here: the NimBLE host task may still be
+    // finishing callbacks that reference these advertised-device objects.
+    // The next scan->start(..., false, ...) clears previous results.
   }
   this->battery_scan_wants_keypad_ = false;
   this->battery_scan_wants_lock_ = false;
